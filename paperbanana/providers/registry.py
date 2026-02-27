@@ -33,6 +33,16 @@ _API_KEY_HINTS = {
         "  2. Set the environment variable:\n\n"
         "  export OPENAI_API_KEY=your-key-here"
     ),
+    "AWS_CREDENTIALS": (
+        "AWS credentials not found for Bedrock.\n\n"
+        "To fix this, configure one of:\n"
+        "  1. Environment variables:\n"
+        "     export AWS_ACCESS_KEY_ID=your-key\n"
+        "     export AWS_SECRET_ACCESS_KEY=your-secret\n\n"
+        "  2. AWS credentials file (~/.aws/credentials):\n"
+        "     aws configure\n\n"
+        "  3. IAM role (for EC2/ECS/Lambda)"
+    ),
 }
 
 
@@ -41,6 +51,21 @@ def _validate_api_key(key_value: str | None, env_var_name: str) -> None:
     if key_value is None or not key_value.strip():
         hint = _API_KEY_HINTS.get(env_var_name, f"{env_var_name} is not set.")
         raise ValueError(hint)
+
+
+def _validate_bedrock_auth(region: str, profile: str | None) -> None:
+    """Raise a helpful error if AWS credentials are not available."""
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError(
+            "boto3 is required for the Bedrock provider. "
+            "Install with: pip install 'paperbanana[bedrock]'"
+        )
+    session = boto3.Session(region_name=region, profile_name=profile)
+    credentials = session.get_credentials()
+    if credentials is None:
+        raise ValueError(_API_KEY_HINTS["AWS_CREDENTIALS"])
 
 
 class ProviderRegistry:
@@ -77,9 +102,19 @@ class ProviderRegistry:
                 model=settings.openai_vlm_model or settings.vlm_model,
                 base_url=settings.openai_base_url,
             )
+        elif provider == "bedrock":
+            _validate_bedrock_auth(settings.aws_region, settings.aws_profile)
+            from paperbanana.providers.vlm.bedrock import BedrockVLM
+
+            return BedrockVLM(
+                model=settings.bedrock_vlm_model or settings.vlm_model,
+                region=settings.aws_region,
+                profile=settings.aws_profile,
+            )
         else:
             raise ValueError(
-                f"Unknown VLM provider: {provider}. Available: gemini, openrouter, openai"
+                f"Unknown VLM provider: {provider}. "
+                f"Available: gemini, openrouter, openai, bedrock"
             )
 
     @staticmethod
@@ -115,8 +150,17 @@ class ProviderRegistry:
                 model=settings.openai_image_model or settings.image_model,
                 base_url=settings.openai_base_url,
             )
+        elif provider == "bedrock_imagen":
+            _validate_bedrock_auth(settings.aws_region, settings.aws_profile)
+            from paperbanana.providers.image_gen.bedrock_imagen import BedrockImageGen
+
+            return BedrockImageGen(
+                model=settings.bedrock_image_model or settings.image_model,
+                region=settings.aws_region,
+                profile=settings.aws_profile,
+            )
         else:
             raise ValueError(
                 f"Unknown image provider: {provider}. "
-                f"Available: google_imagen, openrouter_imagen, openai_imagen"
+                f"Available: google_imagen, openrouter_imagen, openai_imagen, bedrock_imagen"
             )

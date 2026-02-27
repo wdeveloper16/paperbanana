@@ -89,11 +89,19 @@ class Settings(BaseSettings):
     openai_vlm_model: Optional[str] = Field(default=None, alias="OPENAI_VLM_MODEL")
     openai_image_model: Optional[str] = Field(default=None, alias="OPENAI_IMAGE_MODEL")
 
+    # AWS Bedrock settings
+    aws_region: str = Field(default="us-east-1", alias="AWS_REGION")
+    aws_profile: Optional[str] = Field(default=None, alias="AWS_PROFILE")
+    bedrock_vlm_model: Optional[str] = Field(default=None, alias="BEDROCK_VLM_MODEL")
+    bedrock_image_model: Optional[str] = Field(default=None, alias="BEDROCK_IMAGE_MODEL")
+
     @property
     def effective_vlm_model(self) -> str:
         """Return the VLM model for the active provider."""
         if self.vlm_provider == "openai" and self.openai_vlm_model:
             return self.openai_vlm_model
+        if self.vlm_provider == "bedrock" and self.bedrock_vlm_model:
+            return self.bedrock_vlm_model
         return self.vlm_model
 
     @property
@@ -101,6 +109,8 @@ class Settings(BaseSettings):
         """Return the image model for the active provider."""
         if self.image_provider == "openai_imagen" and self.openai_image_model:
             return self.openai_image_model
+        if self.image_provider == "bedrock_imagen" and self.bedrock_image_model:
+            return self.bedrock_image_model
         return self.image_model
 
     # SSL
