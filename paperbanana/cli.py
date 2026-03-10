@@ -1014,6 +1014,164 @@ def ablate_retrieval(
     )
 
 
+@app.command()
+def benchmark(
+    config: Optional[str] = typer.Option(None, "--config", help="Path to config YAML file"),
+    output_dir: Optional[str] = typer.Option(
+        None, "--output-dir", "-o", help="Output directory for benchmark run"
+    ),
+    vlm_provider: Optional[str] = typer.Option(None, "--vlm-provider", help="VLM provider"),
+    vlm_model: Optional[str] = typer.Option(None, "--vlm-model", help="VLM model name"),
+    image_provider: Optional[str] = typer.Option(
+        None, "--image-provider", help="Image gen provider"
+    ),
+    image_model: Optional[str] = typer.Option(None, "--image-model", help="Image gen model name"),
+    iterations: Optional[int] = typer.Option(
+        None, "--iterations", "-n", help="Refinement iterations per entry"
+    ),
+    auto: bool = typer.Option(False, "--auto", help="Loop until critic satisfied per entry"),
+    optimize: bool = typer.Option(False, "--optimize", help="Preprocess inputs per entry"),
+    category: Optional[str] = typer.Option(
+        None, "--category", help="Only run entries in this category"
+    ),
+    ids: Optional[str] = typer.Option(
+        None, "--ids", help="Comma-separated entry IDs to run (e.g., 2601.03570v1,2601.05110v1)"
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Max number of entries to process"
+    ),
+    eval_only: Optional[str] = typer.Option(
+        None,
+        "--eval-only",
+        help="Skip generation; evaluate existing images from this directory",
+    ),
+    image_format: str = typer.Option(
+        "png", "--format", "-f", help="Output image format (png, jpeg, webp)"
+    ),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducibility"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed progress"),
+):
+    """Run generation + evaluation across PaperBananaBench entries."""
+    if image_format not in ("png", "jpeg", "webp"):
+        console.print(
+            f"[red]Error: Format must be png, jpeg, or webp. Got: {image_format}[/red]"
+        )
+        raise typer.Exit(1)
+
+    configure_logging(verbose=verbose)
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    overrides: dict = {"output_format": image_format}
+    if vlm_provider:
+        overrides["vlm_provider"] = vlm_provider
+    if vlm_model:
+        overrides["vlm_model"] = vlm_model
+    if image_provider:
+        overrides["image_provider"] = image_provider
+    if image_model:
+        overrides["image_model"] = image_model
+    if iterations is not None:
+        overrides["refinement_iterations"] = iterations
+    if auto:
+        overrides["auto_refine"] = True
+    if optimize:
+        overrides["optimize_inputs"] = True
+    if output_dir:
+        overrides["output_dir"] = output_dir
+    if seed is not None:
+        overrides["seed"] = seed
+
+    if config:
+        settings = Settings.from_yaml(config, **overrides)
+    else:
+        settings = Settings(**overrides)
+
+    from paperbanana.evaluation.benchmark import BenchmarkRunner
+
+    runner = BenchmarkRunner(settings)
+
+    # Load and filter entries
+    id_list = [s.strip() for s in ids.split(",") if s.strip()] if ids else None
+    try:
+        entries = runner.load_entries(category=category, ids=id_list, limit=limit)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not entries:
+        console.print("[red]Error: No entries match the given filters.[/red]")
+        raise typer.Exit(1)
+
+    mode = "eval-only" if eval_only else "generate + evaluate"
+    console.print(
+        Panel.fit(
+            f"[bold]PaperBanana[/bold] — Benchmark\n\n"
+            f"Entries: {len(entries)}\n"
+            f"Mode: {mode}\n"
+            f"VLM: {settings.vlm_provider} / {settings.effective_vlm_model}\n"
+            f"Image: {settings.image_provider} / {settings.effective_image_model}",
+            border_style="magenta",
+        )
+    )
+    console.print()
+
+    bench_output_dir = Path(output_dir) if output_dir else None
+
+    async def _run():
+        return await runner.run(
+            entries, output_dir=bench_output_dir, eval_only_dir=eval_only
+        )
+
+    report = asyncio.run(_run())
+    summary = report.summary
+
+    if not summary:
+        console.print("[yellow]No entries were successfully evaluated.[/yellow]")
+        return
+
+    # Print summary table
+    console.print(
+        Panel.fit(
+            "[bold]Benchmark Summary[/bold]\n\n"
+            f"Evaluated: {summary.get('evaluated', 0)}\n"
+            f"Model wins: {summary.get('model_wins', 0)}  "
+            f"Human wins: {summary.get('human_wins', 0)}  "
+            f"Ties: {summary.get('ties', 0)}\n"
+            f"Model win rate: {summary.get('model_win_rate', 0)}%\n"
+            f"Mean overall score: {summary.get('mean_overall_score', 0)}/100\n"
+            f"Mean generation time: {summary.get('mean_generation_seconds', 0)}s\n\n"
+            f"Completed: {report.completed}  "
+            f"Failed: {report.failed}  "
+            f"Total: {report.total_seconds}s",
+            border_style="cyan",
+        )
+    )
+
+    # Per-dimension breakdown
+    dim_means = summary.get("dimension_means", {})
+    if dim_means:
+        console.print("\n[bold]Per-dimension scores:[/bold]")
+        for dim, score in dim_means.items():
+            console.print(f"  {dim.capitalize():14s} {score}/100")
+
+    # Per-category breakdown
+    cat_breakdown = summary.get("category_breakdown", {})
+    if cat_breakdown:
+        console.print("\n[bold]Per-category breakdown:[/bold]")
+        for cat, stats in cat_breakdown.items():
+            console.print(
+                f"  {cat:30s} n={stats['count']:3d}  "
+                f"win_rate={stats['model_win_rate']:5.1f}%  "
+                f"mean={stats['mean_score']:.1f}"
+            )
+
+    report_path = Path(report.run_dir) if report.run_dir else Path(settings.output_dir) / report.created_at.replace(":", "")
+    console.print(f"\nReport: [bold]{report_path / 'benchmark_report.json'}[/bold]")
+
+
 # ── Data subcommands ──────────────────────────────────────────────
 
 
