@@ -116,11 +116,7 @@ def aggregate_results(entries: list[BenchmarkEntryResult]) -> dict:
     dimension_means: dict[str, float] = {}
     for dim in DIMENSIONS:
         key = f"{dim}_score"
-        values = [
-            float(e.evaluation[key])
-            for e in scored
-            if e.evaluation and key in e.evaluation
-        ]
+        values = [float(e.evaluation[key]) for e in scored if e.evaluation and key in e.evaluation]
         if values:
             dimension_means[dim] = round(sum(values) / len(values), 1)
 
@@ -192,9 +188,7 @@ class BenchmarkRunner:
         examples = store.get_all()
 
         if not examples:
-            raise ValueError(
-                "No benchmark entries found. Run 'paperbanana data download' first."
-            )
+            raise ValueError("No benchmark entries found. Run 'paperbanana data download' first.")
 
         filtered = filter_examples(examples, category=category, ids=ids, limit=limit)
         logger.info(
@@ -256,8 +250,10 @@ class BenchmarkRunner:
             run_dir=str(run_dir),
             settings_snapshot=self.settings.model_dump(
                 exclude={
-                    "google_api_key", "openai_api_key",
-                    "openrouter_api_key", "anthropic_api_key",
+                    "google_api_key",
+                    "openai_api_key",
+                    "openrouter_api_key",
+                    "anthropic_api_key",
                 }
             ),
             total_entries=len(entries),

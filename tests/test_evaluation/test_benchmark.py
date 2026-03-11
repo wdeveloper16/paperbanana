@@ -27,16 +27,25 @@ from paperbanana.evaluation.benchmark import (
 def _make_examples() -> list[ReferenceExample]:
     return [
         ReferenceExample(
-            id="a1", source_context="ctx1", caption="cap1",
-            image_path="/img/a1.jpg", category="vision",
+            id="a1",
+            source_context="ctx1",
+            caption="cap1",
+            image_path="/img/a1.jpg",
+            category="vision",
         ),
         ReferenceExample(
-            id="a2", source_context="ctx2", caption="cap2",
-            image_path="/img/a2.jpg", category="reasoning",
+            id="a2",
+            source_context="ctx2",
+            caption="cap2",
+            image_path="/img/a2.jpg",
+            category="reasoning",
         ),
         ReferenceExample(
-            id="a3", source_context="ctx3", caption="cap3",
-            image_path="/img/a3.jpg", category="vision",
+            id="a3",
+            source_context="ctx3",
+            caption="cap3",
+            image_path="/img/a3.jpg",
+            category="vision",
         ),
     ]
 
@@ -183,6 +192,7 @@ async def test_benchmark_runner_processes_entries(tmp_path):
     # Create a fake reference image so the runner doesn't skip the entry
     ref_img = tmp_path / "ref.jpg"
     from PIL import Image
+
     Image.new("RGB", (64, 64)).save(ref_img)
 
     entries = [
@@ -253,6 +263,7 @@ async def test_benchmark_runner_skips_missing_reference(tmp_path):
 async def test_benchmark_runner_handles_generation_failure(tmp_path):
     ref_img = tmp_path / "ref.jpg"
     from PIL import Image
+
     Image.new("RGB", (64, 64)).save(ref_img)
 
     class _FailingPipeline:
@@ -293,6 +304,7 @@ async def test_benchmark_runner_eval_only_mode(tmp_path):
     # Set up reference and generated images
     ref_img = tmp_path / "ref.jpg"
     from PIL import Image
+
     Image.new("RGB", (64, 64)).save(ref_img)
 
     gen_dir = tmp_path / "generated"
@@ -335,6 +347,7 @@ async def test_benchmark_runner_eval_only_rejects_path_traversal(tmp_path):
     """Entry ids with '..' or path separators are rejected in eval-only mode."""
     ref_img = tmp_path / "ref.jpg"
     from PIL import Image
+
     Image.new("RGB", (64, 64)).save(ref_img)
 
     gen_dir = tmp_path / "generated"

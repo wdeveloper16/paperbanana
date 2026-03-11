@@ -1147,9 +1147,7 @@ def benchmark(
     ids: Optional[str] = typer.Option(
         None, "--ids", help="Comma-separated entry IDs to run (e.g., 2601.03570v1,2601.05110v1)"
     ),
-    limit: Optional[int] = typer.Option(
-        None, "--limit", help="Max number of entries to process"
-    ),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Max number of entries to process"),
     eval_only: Optional[str] = typer.Option(
         None,
         "--eval-only",
@@ -1163,9 +1161,7 @@ def benchmark(
 ):
     """Run generation + evaluation across PaperBananaBench entries."""
     if image_format not in ("png", "jpeg", "webp"):
-        console.print(
-            f"[red]Error: Format must be png, jpeg, or webp. Got: {image_format}[/red]"
-        )
+        console.print(f"[red]Error: Format must be png, jpeg, or webp. Got: {image_format}[/red]")
         raise typer.Exit(1)
 
     configure_logging(verbose=verbose)
@@ -1231,9 +1227,7 @@ def benchmark(
     bench_output_dir = Path(output_dir) if output_dir else None
 
     async def _run():
-        return await runner.run(
-            entries, output_dir=bench_output_dir, eval_only_dir=eval_only
-        )
+        return await runner.run(entries, output_dir=bench_output_dir, eval_only_dir=eval_only)
 
     report = asyncio.run(_run())
     summary = report.summary
