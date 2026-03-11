@@ -33,6 +33,32 @@ data_app = typer.Typer(
 app.add_typer(data_app, name="data")
 
 
+def _upsert_env_vars(env_path: Path, updates: dict[str, str]) -> None:
+    """Update or append environment variables in a .env file."""
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = []
+
+    key_to_index: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key not in key_to_index:
+            key_to_index[key] = index
+
+    for key, value in updates.items():
+        new_line = f"{key}={value}"
+        if key in key_to_index:
+            lines[key_to_index[key]] = new_line
+        else:
+            lines.append(new_line)
+
+    env_path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+
+
 @app.command()
 def generate(
     input: Optional[str] = typer.Option(
@@ -650,6 +676,68 @@ def batch(
     console.print(f"  Report: [bold]{report_path}[/bold]")
 
 
+@app.command("batch-report")
+def batch_report(
+    batch_dir: Optional[str] = typer.Option(
+        None,
+        "--batch-dir",
+        "-b",
+        help="Path to batch run directory (e.g. outputs/batch_20250109_123456_abc)",
+    ),
+    batch_id: Optional[str] = typer.Option(
+        None,
+        "--batch-id",
+        help="Batch ID (e.g. batch_20250109_123456_abc); resolved under --output-dir",
+    ),
+    output_dir: str = typer.Option(
+        "outputs",
+        "--output-dir",
+        "-o",
+        help="Parent directory for batch runs (used with --batch-id)",
+    ),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output",
+        help="Output path for the report file (default: <batch_dir>/batch_report.<md|html>)",
+    ),
+    format: str = typer.Option(
+        "markdown",
+        "--format",
+        "-f",
+        help="Report format: markdown or html",
+    ),
+):
+    """Generate a human-readable report from an existing batch run (batch_report.json)."""
+    if format not in ("markdown", "html", "md"):
+        console.print(f"[red]Error: Format must be markdown or html. Got: {format}[/red]")
+        raise typer.Exit(1)
+    if batch_dir is None and batch_id is None:
+        console.print("[red]Error: Provide either --batch-dir or --batch-id[/red]")
+        raise typer.Exit(1)
+    if batch_dir is not None and batch_id is not None:
+        console.print("[red]Error: Provide only one of --batch-dir or --batch-id[/red]")
+        raise typer.Exit(1)
+
+    from paperbanana.core.batch import write_batch_report
+
+    if batch_dir is not None:
+        path = Path(batch_dir)
+    else:
+        path = Path(output_dir) / batch_id
+
+    output_path = Path(output) if output else None
+    fmt = "markdown" if format == "md" else format
+    try:
+        written = write_batch_report(path, output_path=output_path, format=fmt)
+        console.print(f"[green]Report written to:[/green] [bold]{written}[/bold]")
+    except FileNotFoundError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def plot(
     data: str = typer.Option(..., "--data", "-d", help="Path to data file (CSV or JSON)"),
@@ -763,29 +851,51 @@ def setup():
         )
     )
 
-    console.print("\n[bold]Step 1: Google Gemini API Key[/bold] (FREE, no credit card)")
-    console.print("This powers the AI agents that plan and critique your diagrams.\n")
-
-    import webbrowser
-
-    open_browser = Prompt.ask(
-        "Open browser to get a free Gemini API key?",
+    console.print("\n[bold]Step 1: Gemini API Configuration[/bold]")
+    use_official_api = Prompt.ask(
+        "Use official Google Gemini API?",
         choices=["y", "n"],
         default="y",
     )
-    if open_browser == "y":
-        webbrowser.open("https://makersuite.google.com/app/apikey")
-
-    gemini_key = Prompt.ask("\nPaste your Gemini API key")
 
     # Save to .env
     env_path = Path(".env")
-    lines = []
-    lines.append(f"GOOGLE_API_KEY={gemini_key}")
+    if use_official_api == "y":
+        console.print("Using official Google AI Studio endpoint (free, no credit card).")
+        console.print("This powers the AI agents that plan and critique your diagrams.\n")
 
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        import webbrowser
 
-    console.print(f"\n[green]Setup complete![/green] Keys saved to {env_path}")
+        open_browser = Prompt.ask(
+            "Open browser to get a free Gemini API key?",
+            choices=["y", "n"],
+            default="y",
+        )
+        if open_browser == "y":
+            webbrowser.open("https://makersuite.google.com/app/apikey")
+
+        gemini_key = Prompt.ask("\nPaste your Gemini API key")
+        env_updates = {
+            "GOOGLE_API_KEY": gemini_key,
+            "GOOGLE_BASE_URL": "",
+        }
+    else:
+        console.print("Using custom Gemini-compatible endpoint.\n")
+        google_base_url = ""
+        while not google_base_url.strip():
+            google_base_url = Prompt.ask("Gemini base URL")
+            if not google_base_url.strip():
+                console.print("[red]URL cannot be empty. Please try again.[/red]")
+
+        gemini_key = Prompt.ask("Paste your Gemini API key")
+        env_updates = {
+            "GOOGLE_API_KEY": gemini_key,
+            "GOOGLE_BASE_URL": google_base_url.strip(),
+        }
+
+    _upsert_env_vars(env_path, env_updates)
+
+    console.print(f"\n[green]Setup complete![/green] Configuration saved to {env_path}")
     console.print("\nTry it out:")
     console.print(
         "  [bold]paperbanana generate --input method.txt"
