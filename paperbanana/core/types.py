@@ -8,6 +8,33 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
+class PipelineProgressStage(str, Enum):
+    """Pipeline stage identifiers for progress callbacks."""
+
+    OPTIMIZER_START = "optimizer_start"
+    OPTIMIZER_END = "optimizer_end"
+    RETRIEVER_START = "retriever_start"
+    RETRIEVER_END = "retriever_end"
+    PLANNER_START = "planner_start"
+    PLANNER_END = "planner_end"
+    STYLIST_START = "stylist_start"
+    STYLIST_END = "stylist_end"
+    VISUALIZER_START = "visualizer_start"
+    VISUALIZER_END = "visualizer_end"
+    CRITIC_START = "critic_start"
+    CRITIC_END = "critic_end"
+
+
+class PipelineProgressEvent(BaseModel):
+    """Single progress event emitted by the pipeline for callbacks."""
+
+    stage: PipelineProgressStage = Field(description="Pipeline stage identifier")
+    message: str = Field(description="Human-readable message")
+    seconds: Optional[float] = Field(default=None, description="Elapsed seconds for this step")
+    iteration: Optional[int] = Field(default=None, description="Refinement iteration (1-based)")
+    extra: Optional[dict[str, Any]] = Field(default=None, description="Optional extra data")
+
+
 class DiagramType(str, Enum):
     """Type of academic illustration to generate."""
 
