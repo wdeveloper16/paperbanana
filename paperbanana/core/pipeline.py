@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 import structlog
 
@@ -119,6 +119,7 @@ class PaperBananaPipeline:
         settings: Optional[Settings] = None,
         vlm_client=None,
         image_gen_fn=None,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         """Initialize the pipeline.
 
@@ -129,6 +130,7 @@ class PaperBananaPipeline:
         """
         self.settings = settings or Settings()
         self.run_id = generate_run_id()
+        self._progress_callback = progress_callback
 
         if self.settings.skip_ssl_verification:
             _apply_ssl_skip()
@@ -200,6 +202,21 @@ class PaperBananaPipeline:
             image_gen=getattr(self._image_gen, "name", "custom"),
         )
 
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        """Emit a structured progress event.
+
+        Events are best-effort: any callback error is logged and ignored so that
+        progress consumers cannot break the main pipeline.
+        """
+        # structlog uses the positional message as the "event" field internally;
+        # avoid passing a keyword named "event" to prevent collisions.
+        logger.info("progress_event", progress_event=event, **payload)
+        if self._progress_callback is not None:
+            try:
+                self._progress_callback(event, payload)
+            except Exception:
+                logger.warning("Progress callback raised", progress_event=event)
+
     @property
     def _run_dir(self) -> Path:
         """Directory for this run's outputs."""
@@ -262,6 +279,13 @@ class PaperBananaPipeline:
         """
         total_start = time.perf_counter()
 
+        self._emit_progress(
+            "generation_started",
+            run_id=self.run_id,
+            diagram_type=input.diagram_type.value,
+            context_length=len(input.source_context),
+        )
+
         # Save input for resume/continue support
         if self.settings.save_iterations:
             save_json(
@@ -300,6 +324,7 @@ class PaperBananaPipeline:
                     message="Optimizing inputs (parallel)",
                 ),
             )
+            self._emit_progress("phase0_optimize_started")
             optimize_start = time.perf_counter()
             optimized = await self.optimizer.run(
                 source_context=input.source_context,
@@ -317,6 +342,10 @@ class PaperBananaPipeline:
             )
             logger.info(
                 "[Optimizer] done",
+                seconds=round(optimize_seconds, 1),
+            )
+            self._emit_progress(
+                "phase0_optimize_completed",
                 seconds=round(optimize_seconds, 1),
             )
 
@@ -351,6 +380,7 @@ class PaperBananaPipeline:
                 message="Retrieving examples",
             ),
         )
+        self._emit_progress("phase1_retrieval_started")
         retrieval_start = time.perf_counter()
         candidates = self.reference_store.get_all()
         (
@@ -384,6 +414,12 @@ class PaperBananaPipeline:
             examples_found=len(examples),
             retrieval_mode=retrieval_mode,
         )
+        self._emit_progress(
+            "phase1_retrieval_completed",
+            seconds=round(retrieval_seconds, 1),
+            examples_found=len(examples),
+            retrieval_mode=retrieval_mode,
+        )
 
         # Step 2: Planner — generate textual description
         logger.info("Phase 1: Planning")
@@ -394,6 +430,7 @@ class PaperBananaPipeline:
                 message="Planning description",
             ),
         )
+        self._emit_progress("phase1_planning_started")
         planning_start = time.perf_counter()
         description, planner_ratio = await self.planner.run(
             source_context=input.source_context,
@@ -412,6 +449,11 @@ class PaperBananaPipeline:
                 extra={"recommended_ratio": planner_ratio},
             ),
         )
+        self._emit_progress(
+            "phase1_planning_completed",
+            seconds=round(planning_seconds, 1),
+            recommended_ratio=planner_ratio,
+        )
 
         # Step 3: Stylist — optimize description aesthetics
         logger.info("Phase 1: Styling")
@@ -422,6 +464,7 @@ class PaperBananaPipeline:
                 message="Styling description",
             ),
         )
+        self._emit_progress("phase1_styling_started")
         styling_start = time.perf_counter()
         optimized_description = await self.stylist.run(
             description=description,
@@ -438,6 +481,10 @@ class PaperBananaPipeline:
                 message="Stylist done",
                 seconds=styling_seconds,
             ),
+        )
+        self._emit_progress(
+            "phase1_styling_completed",
+            seconds=round(styling_seconds, 1),
         )
 
         # Save planning outputs
@@ -457,10 +504,16 @@ class PaperBananaPipeline:
         # Aspect ratio priority: user-specified > planner-recommended > default (None)
         effective_ratio = input.aspect_ratio or planner_ratio
         if effective_ratio:
+            ratio_source = "user" if input.aspect_ratio else "planner"
             logger.info(
                 "Using aspect ratio",
-                source="user" if input.aspect_ratio else "planner",
+                source=ratio_source,
                 ratio=effective_ratio,
+            )
+            self._emit_progress(
+                "aspect_ratio_selected",
+                ratio=effective_ratio,
+                source=ratio_source,
             )
 
         current_description = optimized_description
@@ -473,9 +526,16 @@ class PaperBananaPipeline:
             total_iters = self.settings.refinement_iterations
 
         for i in range(total_iters):
+            iter_index = i + 1
             logger.info(
-                f"Phase 2: Iteration {i + 1}/{total_iters}"
+                f"Phase 2: Iteration {iter_index}/{total_iters}"
                 + (" (auto)" if self.settings.auto_refine else "")
+            )
+            self._emit_progress(
+                "iteration_started",
+                iteration=iter_index,
+                total_iterations=total_iters,
+                auto=self.settings.auto_refine,
             )
 
             # Step 4: Visualizer — generate image
@@ -493,7 +553,7 @@ class PaperBananaPipeline:
                 description=current_description,
                 diagram_type=input.diagram_type,
                 raw_data=input.raw_data,
-                iteration=i + 1,
+                iteration=iter_index,
                 seed=self.settings.seed,
                 aspect_ratio=effective_ratio,
             )
@@ -508,7 +568,12 @@ class PaperBananaPipeline:
                 ),
             )
             logger.info(
-                f"[Visualizer] Iteration {i + 1}/{total_iters} done",
+                f"[Visualizer] Iteration {iter_index}/{total_iters} done",
+                seconds=round(visualizer_seconds, 1),
+            )
+            self._emit_progress(
+                "visualizer_completed",
+                iteration=iter_index,
                 seconds=round(visualizer_seconds, 1),
             )
 
@@ -544,16 +609,22 @@ class PaperBananaPipeline:
                     },
                 ),
             )
+            self._emit_progress(
+                "critic_completed",
+                iteration=iter_index,
+                seconds=round(critic_seconds, 1),
+                needs_revision=critique.needs_revision,
+            )
 
             iteration_record = IterationRecord(
-                iteration=i + 1,
+                iteration=iter_index,
                 description=current_description,
                 image_path=image_path,
                 critique=critique,
             )
             iteration_timings.append(
                 {
-                    "iteration": i + 1,
+                    "iteration": iter_index,
                     "visualizer_seconds": visualizer_seconds,
                     "critic_seconds": critic_seconds,
                 }
@@ -575,17 +646,30 @@ class PaperBananaPipeline:
             if critique.needs_revision and critique.revised_description:
                 logger.info(
                     "Revision needed",
-                    iteration=i + 1,
+                    iteration=iter_index,
                     summary=critique.summary,
                 )
                 current_description = critique.revised_description
             else:
                 logger.info(
                     "No further revision needed",
-                    iteration=i + 1,
+                    iteration=iter_index,
                     summary=critique.summary,
                 )
+                self._emit_progress(
+                    "iteration_completed",
+                    iteration=iter_index,
+                    total_iterations=len(iterations),
+                    needs_revision=critique.needs_revision,
+                )
                 break
+
+            self._emit_progress(
+                "iteration_completed",
+                iteration=iter_index,
+                total_iterations=len(iterations),
+                needs_revision=critique.needs_revision,
+            )
 
         # Final output
         final_image = iterations[-1].image_path
@@ -602,6 +686,12 @@ class PaperBananaPipeline:
             "Total generation time",
             run_id=self.run_id,
             total_seconds=total_seconds,
+        )
+        self._emit_progress(
+            "generation_completed",
+            run_id=self.run_id,
+            total_seconds=total_seconds,
+            iterations=len(iterations),
         )
 
         # Build metadata
@@ -693,6 +783,13 @@ class PaperBananaPipeline:
             additional_iterations=total_iters,
             has_feedback=user_feedback is not None,
         )
+        self._emit_progress(
+            "continue_started",
+            run_id=self.run_id,
+            from_iteration=start_iter,
+            additional_iterations=total_iters,
+            has_feedback=user_feedback is not None,
+        )
 
         iterations: list[IterationRecord] = []
         iteration_timings = []
@@ -701,6 +798,13 @@ class PaperBananaPipeline:
             iter_num = start_iter + i + 1
             logger.info(
                 f"Phase 2: Iteration {iter_num}" + (" (auto)" if self.settings.auto_refine else "")
+            )
+            self._emit_progress(
+                "iteration_started",
+                iteration=iter_num,
+                total_iterations=start_iter + total_iters,
+                auto=self.settings.auto_refine,
+                mode="continue",
             )
 
             # Visualizer — generate image
@@ -735,6 +839,12 @@ class PaperBananaPipeline:
             logger.info(
                 f"[Visualizer] Iteration {iter_num} done",
                 seconds=round(visualizer_seconds, 1),
+            )
+            self._emit_progress(
+                "visualizer_completed",
+                iteration=iter_num,
+                seconds=round(visualizer_seconds, 1),
+                mode="continue",
             )
 
             # Critic — evaluate with optional user feedback
@@ -774,6 +884,13 @@ class PaperBananaPipeline:
                 "[Critic] done",
                 seconds=round(critic_seconds, 1),
                 needs_revision=critique.needs_revision,
+            )
+            self._emit_progress(
+                "critic_completed",
+                iteration=iter_num,
+                seconds=round(critic_seconds, 1),
+                needs_revision=critique.needs_revision,
+                mode="continue",
             )
 
             iteration_record = IterationRecord(
@@ -817,6 +934,14 @@ class PaperBananaPipeline:
                 )
                 break
 
+            self._emit_progress(
+                "iteration_completed",
+                iteration=iter_num,
+                total_iterations=start_iter + len(iterations),
+                needs_revision=critique.needs_revision,
+                mode="continue",
+            )
+
         # Final output
         final_image = iterations[-1].image_path
         output_format = getattr(self.settings, "output_format", "png").lower()
@@ -829,6 +954,12 @@ class PaperBananaPipeline:
         total_seconds = time.perf_counter() - total_start
         logger.info(
             "Continue run complete",
+            run_id=self.run_id,
+            total_seconds=total_seconds,
+            new_iterations=len(iterations),
+        )
+        self._emit_progress(
+            "continue_completed",
             run_id=self.run_id,
             total_seconds=total_seconds,
             new_iterations=len(iterations),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as json_mod
 import time
 from pathlib import Path
 from typing import Optional
@@ -67,7 +68,10 @@ def _upsert_env_vars(env_path: Path, updates: dict[str, str]) -> None:
 @app.command()
 def generate(
     input: Optional[str] = typer.Option(
-        None, "--input", "-i", help="Path to methodology text file"
+        None,
+        "--input",
+        "-i",
+        help="Path to methodology text file or PDF (.pdf requires: pip install 'paperbanana[pdf]')",
     ),
     caption: Optional[str] = typer.Option(
         None, "--caption", "-c", help="Figure caption / communicative intent"
@@ -167,6 +171,15 @@ def generate(
         None,
         "--venue",
         help="Target venue style (neurips, icml, acl, ieee, custom)",
+    progress_json: bool = typer.Option(
+        False,
+        "--progress-json",
+        help="Emit machine-readable JSON progress events to stdout during generation",
+    ),
+    pdf_pages: Optional[str] = typer.Option(
+        None,
+        "--pdf-pages",
+        help=("PDF input only: 1-based pages (e.g. '1-5', '3', '1-3,7,10-12'); default: all pages"),
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Show detailed agent progress and timing"
@@ -188,6 +201,9 @@ def generate(
     if venue and venue.lower() not in ("neurips", "icml", "acl", "ieee", "custom"):
         console.print(
             f"[red]Error: --venue must be neurips, icml, acl, ieee, or custom. Got: {venue}[/red]"
+    if pdf_pages and (continue_last or continue_run):
+        console.print(
+            "[red]Error: --pdf-pages cannot be used with --continue or --continue-run[/red]"
         )
         raise typer.Exit(1)
 
@@ -353,13 +369,22 @@ def generate(
         console.print("[red]Error: --caption is required for new runs[/red]")
         raise typer.Exit(1)
 
-    # Load source text
+    # Load source text (plain UTF-8 or PDF)
     input_path = Path(input)
     if not input_path.exists():
         console.print(f"[red]Error: Input file not found: {input}[/red]")
         raise typer.Exit(1)
 
-    source_context = input_path.read_text(encoding="utf-8")
+    from paperbanana.core.source_loader import load_methodology_source
+
+    try:
+        source_context = load_methodology_source(input_path, pdf_pages=pdf_pages)
+    except ImportError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
 
     # Build generation input
     gen_input = GenerationInput(
@@ -378,10 +403,13 @@ def generate(
             if output
             else Path(settings.output_dir) / generate_run_id() / f"final_output.{output_ext}"
         )
+        pdf_note = ""
+        if input_path.suffix.lower() == ".pdf":
+            pdf_note = f"\nPDF pages: {pdf_pages.strip() if pdf_pages else 'all'}"
         console.print(
             Panel.fit(
                 "[bold]PaperBanana[/bold] - Dry Run\n\n"
-                f"Input: {input_path}\n"
+                f"Input: {input_path}{pdf_note}\n"
                 f"Caption: {caption}\n"
                 f"VLM: {settings.vlm_provider} / {settings.vlm_model}\n"
                 f"Image: {settings.image_provider} / {settings.image_model}\n"
@@ -396,15 +424,16 @@ def generate(
     else:
         iter_label = str(settings.refinement_iterations)
 
-    console.print(
-        Panel.fit(
-            f"[bold]PaperBanana[/bold] - Generating Methodology Diagram\n\n"
-            f"VLM: {settings.vlm_provider} / {settings.effective_vlm_model}\n"
-            f"Image: {settings.image_provider} / {settings.effective_image_model}\n"
-            f"Iterations: {iter_label}",
-            border_style="blue",
+    if not progress_json:
+        console.print(
+            Panel.fit(
+                f"[bold]PaperBanana[/bold] - Generating Methodology Diagram\n\n"
+                f"VLM: {settings.vlm_provider} / {settings.effective_vlm_model}\n"
+                f"Image: {settings.image_provider} / {settings.effective_image_model}\n"
+                f"Iterations: {iter_label}",
+                border_style="blue",
+            )
         )
-    )
 
     # Run pipeline
 
@@ -412,11 +441,21 @@ def generate(
     total_start = time.perf_counter()
 
     async def _run_with_progress():
-        pipeline = PaperBananaPipeline(settings=settings)
+        def _on_progress(event: str, payload: dict) -> None:
+            if progress_json:
+                console.print(
+                    json_mod.dumps({"event": event, **payload}),
+                    highlight=False,
+                )
+
+        pipeline = PaperBananaPipeline(
+            settings=settings,
+            progress_callback=_on_progress if progress_json else None,
+        )
 
         # Hint: show if using small built-in reference set
         ref_count = pipeline.reference_store.count
-        if ref_count <= 20 and not auto_download_data:
+        if ref_count <= 20 and not auto_download_data and not progress_json:
             console.print(
                 "  [dim]Using built-in reference set"
                 f" ({ref_count} examples). For better results:[/dim]"
@@ -494,7 +533,10 @@ def generate(
                 else:
                     console.print("    [green]✓[/green] [bold green]Critic satisfied[/bold green]")
 
-        return await pipeline.generate(gen_input, progress_callback=on_progress)
+        return await pipeline.generate(
+            gen_input,
+            progress_callback=on_progress if not progress_json else None,
+        )
 
     result = asyncio.run(_run_with_progress())
     total_elapsed = time.perf_counter() - total_start
@@ -655,7 +697,37 @@ def batch(
                 }
             )
             continue
-        source_context = input_path.read_text(encoding="utf-8")
+        from paperbanana.core.source_loader import load_methodology_source
+
+        try:
+            source_context = load_methodology_source(input_path, pdf_pages=item.get("pdf_pages"))
+        except ImportError as e:
+            console.print(f"[red]Skipping item '{item_id}': {e}[/red]")
+            report["items"].append(
+                {
+                    "id": item_id,
+                    "input": item["input"],
+                    "caption": item["caption"],
+                    "run_id": None,
+                    "output_path": None,
+                    "error": str(e),
+                }
+            )
+            continue
+        except ValueError as e:
+            console.print(f"[red]Skipping item '{item_id}': {e}[/red]")
+            report["items"].append(
+                {
+                    "id": item_id,
+                    "input": item["input"],
+                    "caption": item["caption"],
+                    "run_id": None,
+                    "output_path": None,
+                    "error": str(e),
+                }
+            )
+            continue
+
         gen_input = GenerationInput(
             source_context=source_context,
             communicative_intent=item["caption"],
@@ -943,7 +1015,7 @@ def setup():
 @app.command()
 def evaluate(
     generated: str = typer.Option(..., "--generated", "-g", help="Path to generated image"),
-    context: str = typer.Option(..., "--context", help="Path to source context text file"),
+    context: str = typer.Option(..., "--context", help="Path to source context text file or PDF"),
     caption: str = typer.Option(..., "--caption", "-c", help="Figure caption"),
     reference: str = typer.Option(..., "--reference", "-r", help="Path to human reference image"),
     vlm_provider: str = typer.Option(
@@ -951,6 +1023,11 @@ def evaluate(
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Show detailed agent progress and timing"
+    ),
+    pdf_pages: Optional[str] = typer.Option(
+        None,
+        "--pdf-pages",
+        help="PDF context only: 1-based page selection (default: all pages)",
     ),
 ):
     """Evaluate a generated diagram vs human reference (comparative)."""
@@ -968,7 +1045,21 @@ def evaluate(
         console.print(f"[red]Error: Reference image not found: {reference}[/red]")
         raise typer.Exit(1)
 
-    context_text = Path(context).read_text(encoding="utf-8")
+    context_path = Path(context)
+    if not context_path.exists():
+        console.print(f"[red]Error: Context file not found: {context}[/red]")
+        raise typer.Exit(1)
+
+    from paperbanana.core.source_loader import load_methodology_source
+
+    try:
+        context_text = load_methodology_source(context_path, pdf_pages=pdf_pages)
+    except ImportError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
 
     from dotenv import load_dotenv
 
@@ -1014,7 +1105,12 @@ def evaluate(
 
 @app.command("ablate-retrieval")
 def ablate_retrieval(
-    input: str = typer.Option(..., "--input", "-i", help="Path to methodology text file"),
+    input: str = typer.Option(
+        ...,
+        "--input",
+        "-i",
+        help="Path to methodology text file or PDF",
+    ),
     caption: str = typer.Option(
         ..., "--caption", "-c", help="Figure caption / communicative intent"
     ),
@@ -1055,6 +1151,11 @@ def ablate_retrieval(
     ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Show detailed agent progress and timing"
+    ),
+    pdf_pages: Optional[str] = typer.Option(
+        None,
+        "--pdf-pages",
+        help="PDF input only: 1-based page selection (default: all pages)",
     ),
 ):
     """Run baseline vs retrieval ablation (k sweep) and save a JSON report."""
@@ -1107,8 +1208,19 @@ def ablate_retrieval(
     else:
         settings = Settings(**overrides)
 
+    from paperbanana.core.source_loader import load_methodology_source
+
+    try:
+        source_context = load_methodology_source(input_path, pdf_pages=pdf_pages)
+    except ImportError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
     gen_input = GenerationInput(
-        source_context=input_path.read_text(encoding="utf-8"),
+        source_context=source_context,
         communicative_intent=caption,
         diagram_type=DiagramType.METHODOLOGY,
     )
