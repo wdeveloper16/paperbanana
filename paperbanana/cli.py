@@ -162,6 +162,11 @@ def generate(
         "--exemplar-retries",
         help="Retry attempts for external exemplar retrieval on transient errors",
     ),
+    prompt_dir: Optional[str] = typer.Option(
+        None,
+        "--prompt-dir",
+        help="Path to alternative prompt templates directory (for A/B testing)",
+    ),
     seed: Optional[int] = typer.Option(
         None,
         "--seed",
@@ -251,6 +256,8 @@ def generate(
         overrides["seed"] = seed
     if venue:
         overrides["venue"] = venue
+    if prompt_dir:
+        overrides["prompt_dir"] = prompt_dir
 
     if config:
         settings = Settings.from_yaml(config, **overrides)
@@ -1276,6 +1283,145 @@ def ablate_retrieval(
     )
 
 
+@app.command("ablate-prompts")
+def ablate_prompts(
+    variant_prompt_dir: str = typer.Option(
+        ..., "--variant-dir", help="Path to the variant prompt templates directory"
+    ),
+    baseline_prompt_dir: Optional[str] = typer.Option(
+        None, "--baseline-dir", help="Path to baseline prompt templates (default: built-in prompts)"
+    ),
+    variant_name: str = typer.Option("variant", "--variant-name", help="Label for the variant"),
+    baseline_name: str = typer.Option("baseline", "--baseline-name", help="Label for the baseline"),
+    category: Optional[str] = typer.Option(
+        None, "--category", help="Only run entries in this category"
+    ),
+    ids: Optional[str] = typer.Option(None, "--ids", help="Comma-separated entry IDs to compare"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Max entries to compare"),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducibility"),
+    output_report: Optional[str] = typer.Option(
+        None, "--output-report", "-o", help="Output JSON report path"
+    ),
+    config: Optional[str] = typer.Option(None, "--config", help="Path to config YAML file"),
+    vlm_provider: Optional[str] = typer.Option(None, "--vlm-provider", help="VLM provider"),
+    image_provider: Optional[str] = typer.Option(
+        None, "--image-provider", help="Image generation provider"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed progress"),
+):
+    """Run A/B comparison of two prompt configurations and produce a scored report."""
+    configure_logging(verbose=verbose)
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    overrides: dict = {}
+    if vlm_provider:
+        overrides["vlm_provider"] = vlm_provider
+    if image_provider:
+        overrides["image_provider"] = image_provider
+    if seed is not None:
+        overrides["seed"] = seed
+
+    if config:
+        settings = Settings.from_yaml(config, **overrides)
+    else:
+        settings = Settings(**overrides)
+
+    from paperbanana.evaluation.benchmark import filter_examples
+    from paperbanana.evaluation.prompt_ablation import (
+        PromptAblationRunner,
+        validate_prompt_dir,
+    )
+    from paperbanana.reference.store import ReferenceStore
+
+    try:
+        validate_prompt_dir(variant_prompt_dir)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if baseline_prompt_dir:
+        try:
+            validate_prompt_dir(baseline_prompt_dir)
+        except ValueError as e:
+            console.print(f"[red]Error: {e}[/red]")
+            raise typer.Exit(1)
+
+    runner = PromptAblationRunner(
+        settings,
+        baseline_prompt_dir=baseline_prompt_dir,
+        variant_prompt_dir=variant_prompt_dir,
+        baseline_name=baseline_name,
+        variant_name=variant_name,
+    )
+
+    id_list = [s.strip() for s in ids.split(",") if s.strip()] if ids else None
+    try:
+        store = ReferenceStore.from_settings(settings)
+        examples = store.get_all()
+        if not examples:
+            raise ValueError("No benchmark entries found. Run 'paperbanana data download' first.")
+        entries = filter_examples(examples, category=category, ids=id_list, limit=limit)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+    if not entries:
+        console.print("[red]Error: No entries match the given filters.[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel.fit(
+            f"[bold]PaperBanana[/bold] — Prompt A/B Comparison\n\n"
+            f"Baseline: {runner.baseline_prompt_dir} ({baseline_name})\n"
+            f"Variant:  {variant_prompt_dir} ({variant_name})\n"
+            f"Entries:  {len(entries)}\n"
+            f"Seed:     {settings.seed or 'none'}",
+            border_style="magenta",
+        )
+    )
+
+    report = asyncio.run(runner.run(entries))
+
+    default_path = Path(settings.output_dir) / f"prompt_ablation_{generate_run_id()}.json"
+    report_path = Path(output_report) if output_report else default_path
+    saved_path = PromptAblationRunner.save_report(report, report_path)
+
+    summary = report.summary
+    if not summary:
+        console.print("[yellow]No entries were successfully scored.[/yellow]")
+        console.print(f"\nReport: [bold]{saved_path}[/bold]")
+        return
+
+    # Display results
+    deltas = summary.get("mean_dimension_deltas", {})
+    delta_lines = []
+    for dim, delta in deltas.items():
+        sign = "+" if delta > 0 else ""
+        delta_lines.append(f"  {dim.capitalize():14s} {sign}{delta}")
+
+    console.print(
+        Panel.fit(
+            "[bold]Prompt Ablation Summary[/bold]\n\n"
+            f"Scored:           {summary.get('scored', 0)}\n"
+            f"Variant wins:     {summary.get('variant_wins', 0)}  "
+            f"({summary.get('variant_win_rate', 0)}%)\n"
+            f"Baseline wins:    {summary.get('baseline_wins', 0)}  "
+            f"({summary.get('baseline_win_rate', 0)}%)\n"
+            f"Ties:             {summary.get('ties', 0)}\n\n"
+            f"Mean baseline:    {summary.get('mean_baseline_score', 0)}/100\n"
+            f"Mean variant:     {summary.get('mean_variant_score', 0)}/100\n"
+            f"Mean delta:       {summary.get('mean_overall_delta', 0):+.1f}\n\n"
+            "[bold]Per-dimension deltas (variant - baseline):[/bold]\n" + "\n".join(delta_lines),
+            border_style="cyan",
+        )
+    )
+
+    console.print(f"\nReport: [bold]{saved_path}[/bold]")
+
+
 @app.command()
 def benchmark(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config YAML file"),
@@ -1309,6 +1455,11 @@ def benchmark(
         "png", "--format", "-f", help="Output image format (png, jpeg, webp)"
     ),
     seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducibility"),
+    prompt_dir: Optional[str] = typer.Option(
+        None,
+        "--prompt-dir",
+        help="Path to alternative prompt templates directory",
+    ),
     concurrency: int = typer.Option(
         1,
         "--concurrency",
@@ -1350,6 +1501,8 @@ def benchmark(
         overrides["output_dir"] = output_dir
     if seed is not None:
         overrides["seed"] = seed
+    if prompt_dir:
+        overrides["prompt_dir"] = prompt_dir
 
     if config:
         settings = Settings.from_yaml(config, **overrides)
@@ -1523,6 +1676,75 @@ def clear():
 
     dm.clear()
     console.print("[green]Cached reference set cleared.[/green]")
+
+
+@app.command()
+def studio(
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="Bind address for the Studio server",
+    ),
+    port: int = typer.Option(
+        7860,
+        "--port",
+        help="TCP port for the Studio server",
+    ),
+    share: bool = typer.Option(
+        False,
+        "--share",
+        help="Create a temporary public Gradio share link",
+    ),
+    config: Optional[str] = typer.Option(
+        None,
+        "--config",
+        help="Path to YAML config (same as CLI generate)",
+    ),
+    output_dir: str = typer.Option(
+        "outputs",
+        "--output-dir",
+        "-o",
+        help="Default output directory (overridable in the Studio UI)",
+    ),
+    root_path: Optional[str] = typer.Option(
+        None,
+        "--root-path",
+        help="Root URL path when behind a reverse proxy",
+    ),
+):
+    """Launch PaperBanana Studio — local web UI for diagrams, plots, and evaluation."""
+    try:
+        from paperbanana.studio.app import launch_studio as launch_studio_ui
+    except ImportError as e:
+        console.print(
+            "[red]PaperBanana Studio requires Gradio. Install with:[/red]\n"
+            "  pip install 'paperbanana[studio]'"
+        )
+        console.print(f"[dim]{e}[/dim]")
+        raise typer.Exit(1)
+
+    configure_logging(verbose=False)
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    url = f"http://{host}:{port}/"
+    console.print(
+        Panel.fit(
+            f"[bold]PaperBanana Studio[/bold]\n\n"
+            f"Open in browser: [link={url}]{url}[/link]\n"
+            f"Default output directory: {output_dir}",
+            border_style="green",
+        )
+    )
+    launch_studio_ui(
+        host=host,
+        port=port,
+        share=share,
+        config_path=config,
+        default_output_dir=output_dir,
+        root_path=root_path,
+    )
 
 
 if __name__ == "__main__":
